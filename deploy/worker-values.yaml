@@ -1,0 +1,283 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Devtron deployment values for the Temporal money-transfer WORKER.
+#
+# This worker is NOT an HTTP service: it polls the Temporal task queue over gRPC
+# and only listens on the Prometheus metrics port (9464). All the HTTP plumbing
+# (ingress / envoy front / flagger / istio / ambassador) is therefore left
+# disabled — the worker takes no inbound application traffic.
+#
+# Changes vs. the stock chart (why this differs from the default):
+#   1. EnvVariables   — set TEMPORAL_* so the worker can actually reach Temporal.
+#   2. KEDA trigger   — taskQueue/namespace/endpoint now MATCH the worker.
+#   3. Probes + port  — moved off the dead :8080 onto the live metrics port :9464.
+#   4. resources      — bumped from 50Mi (instant OOMKill) to realistic values.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (3) The worker's only listening socket is the Prometheus metrics endpoint.
+ContainerPort:
+  - name: metrics
+    port: 9464          # PROMETHEUS_BIND_ADDRESS port (see EnvVariables)
+    servicePort: 9464
+    protocol: TCP
+    supportStreaming: false
+    useHTTP2: false
+
+# (1) The worker reads its connection config from the environment. Without
+# TEMPORAL_ADDRESS it defaults to localhost:7233 and crash-loops in-cluster.
+# These MUST stay in sync with the KEDA trigger metadata below.
+EnvVariables:
+  - name: TEMPORAL_ADDRESS
+    value: "temporal-frontend.temporal.svc.cluster.local:7233"
+  - name: TEMPORAL_NAMESPACE
+    value: "default"
+  - name: TEMPORAL_TASK_QUEUE
+    value: "money-transfer"
+  - name: PROMETHEUS_BIND_ADDRESS
+    value: "0.0.0.0:9464"
+  # Drain in-flight tasks for up to 25s on SIGTERM; must be < GracePeriod (30s).
+  - name: SHUTDOWN_GRACE_TIME
+    value: "25s"
+
+# Pod gets 30s to terminate; the worker drains for 25s (SHUTDOWN_GRACE_TIME),
+# leaving headroom for a clean exit before SIGKILL.
+GracePeriod: 30
+
+# (3) Probes target the live metrics port via TCP. The metrics server is brought
+# up by Runtime.install() BEFORE the worker connects, so an open socket on 9464
+# is a valid "process is alive" signal. If the process dies, the port closes.
+LivenessProbe:
+  port: 9464
+  tcp: true
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+  Path: ""
+  command: []
+  grpc: {}
+  httpHeaders: []
+  scheme: ""
+
+ReadinessProbe:
+  port: 9464
+  tcp: true
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+  Path: ""
+  command: []
+  grpc: {}
+  httpHeaders: []
+  scheme: ""
+
+StartupProbe:
+  port: 9464
+  tcp: true
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+  Path: ""
+  command: []
+  httpHeaders: []
+
+MaxSurge: 1
+MaxUnavailable: 0
+MinReadySeconds: 60
+
+Spec:
+  Affinity:
+    Key: ""
+    Values: ""
+
+# args/command left disabled so the image CMD (node lib/worker.js) runs.
+args:
+  enabled: false
+  value: []
+command:
+  enabled: false
+  value: []
+  workingDir: {}
+
+# Standard HPA disabled — KEDA manages scaling instead.
+autoscaling:
+  enabled: false
+  MaxReplicas: 2
+  MinReplicas: 1
+  TargetCPUUtilizationPercentage: 90
+  TargetMemoryUtilizationPercentage: 80
+  annotations: {}
+  behavior: {}
+  containerResource:
+    enabled: false
+    TargetCPUUtilizationPercentage: 90
+    TargetMemoryUtilizationPercentage: 80
+  extraMetrics: []
+  labels: {}
+
+containerSecurityContext: {}
+containerSpec:
+  lifecycle:
+    enabled: false
+containers: []
+dbMigrationConfig:
+  enabled: false
+deploymentAnnotations: {}
+deploymentLabels: {}
+
+# Envoy sidecar is irrelevant for a worker (no inbound HTTP), but harmless if the
+# platform injects it. Left at defaults.
+envoyproxy:
+  configMapName: ""
+  image: quay.io/devtron/envoy:v1.16.0
+  lifecycle: {}
+  resources:
+    limits:
+      cpu: 50m
+      memory: 50Mi
+    requests:
+      cpu: 50m
+      memory: 50Mi
+
+flaggerCanary:
+  enabled: false
+hostAliases: []
+image:
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# No inbound traffic to a worker — all ingress disabled.
+ingress:
+  enabled: false
+ingressInternal:
+  enabled: false
+initContainers: []
+istio:
+  enable: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (2) KEDA Autoscaling — Temporal Task Queue scaler
+#
+# KEDA polls the Temporal frontend gRPC API and reads the task-queue backlog
+# (it does NOT use the worker's Prometheus metrics).
+#   desired replicas = ceil(backlog / targetQueueSize)
+#
+# endpoint / taskQueue / namespace MUST match the worker's EnvVariables above,
+# otherwise KEDA scales a queue the worker never polls.
+# ─────────────────────────────────────────────────────────────────────────────
+kedaAutoscaling:
+  enabled: true
+  minReplicaCount: 1      # Keep >=1 in prod to avoid cold starts. 0 only if scale-to-zero is safe.
+  maxReplicaCount: 10     # Hard ceiling — tune to cluster capacity.
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+
+  # Enable only for Temporal Cloud (API key) or a self-hosted cluster with mTLS.
+  # NOTE: the worker app itself currently connects WITHOUT TLS — if you enable
+  # this, also add TLS/API-key support to src/worker.ts (NativeConnection.connect
+  # tls/apiKey options) or the worker won't connect even though KEDA can.
+  triggerAuthentication:
+    enabled: false
+    name: ""
+    spec: {}
+
+  authenticationRef: {}
+  envSourceContainerName: ""
+
+  triggers:
+    - type: temporal
+      metadata:
+        # Must be reachable from the KEDA operator pod (mind NetworkPolicies).
+        endpoint: "temporal-frontend.temporal.svc.cluster.local:7233"
+        # Must EXACTLY match the worker's TEMPORAL_TASK_QUEUE.
+        taskQueue: "money-transfer"
+        # Temporal namespace (not the k8s namespace).
+        namespace: "default"
+        # Pending tasks per replica before adding a pod. Start at 5; tune to latency.
+        targetQueueSize: "5"
+        # Backlog needed to wake the first pod (only relevant if minReplicaCount: 0).
+        activationTargetQueueSize: "1"
+        # Watch both workflow and activity task queues.
+        queueTypes: "workflow,activity"
+        # pollingInterval: "10"   # seconds; how often KEDA queries Temporal
+
+networkPolicy:
+  enabled: false
+pauseForSecondsBeforeSwitchActive: 30
+podAnnotations: {}
+podDisruptionBudget: {}
+podLabels: {}
+podSecurityContext: {}
+
+prometheus:
+  release: monitoring
+
+rawYaml: []
+
+# KEDA owns the replica count. Keep at 1 so one pod is ready on first deploy
+# before KEDA's ScaledObject takes over. Do NOT raise this alongside KEDA.
+replicaCount: 1
+
+# (4) Realistic resources. The worker webpack-bundles workflows at startup and
+# runs a V8 isolate + the Rust core-bridge — 50Mi would OOMKill before it polls.
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+restartPolicy: Always
+secret:
+  data: {}
+  enabled: false
+
+server:
+  deployment:
+    image: ""
+    image_tag: 1-95af053
+
+# ClusterIP is unused by the worker itself, but exposing 9464 lets a ServiceMonitor
+# scrape SDK metrics. Set servicemonitor.enabled / port to 9464 if you use Prometheus Operator.
+service:
+  annotations: {}
+  loadBalancerSourceRanges: []
+  type: ClusterIP
+
+serviceAccount:
+  annotations: {}
+  create: false
+  name: ""
+
+# Enable to have Prometheus Operator scrape the worker's :9464 /metrics endpoint.
+servicemonitor:
+  additionalLabels: {}
+
+tolerations: []
+topologySpreadConstraints: []
+verticalPodScaling:
+  enabled: false
+volumeMounts: []
+volumes: []
+waitForSecondsBeforeScalingDown: 30
+winterSoldier:
+  enabled: false
